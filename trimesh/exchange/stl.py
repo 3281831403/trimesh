@@ -199,17 +199,33 @@ def load_stl_ascii(file_obj: Stream) -> dict:
         vertices = vertices.reshape((-1, 3))
         faces = np.arange(len(vertices)).reshape((-1, 3))
 
-        # try to extract the face normals the same way
+        # try to extract the face normals per-facet so that a solid
+        # name containing the word "normal" or a single facet with a
+        # missing or broken normal line doesn't discard the normals
+        # of every other facet in the solid
         face_normals = None
         try:
-            normal_text = solid.split("normal")
-            normals = np.fromstring(
-                " ".join(line[: line.find("\n")] for line in normal_text[1:]),
-                sep=" ",
-                dtype=np.float64,
-            )
-            if len(normals) == len(vertices):
-                face_normals = normals.reshape((-1, 3))
+            # drop the `solid <name>` line so keywords inside the
+            # name can't corrupt the per-facet parsing
+            body = solid[solid.find("\n") + 1 :]
+            chunks = body.split("facet")[1:]
+            if len(chunks) == len(faces):
+                # facets without a parseable normal stay NaN and are
+                # recomputed from the vertex winding by the constructor
+                normals = np.full((len(chunks), 3), np.nan)
+                for i, chunk in enumerate(chunks):
+                    start = chunk.find("normal")
+                    if start < 0:
+                        continue
+                    line = chunk[start + len("normal") :]
+                    line = line[: line.find("\n")]
+                    try:
+                        parsed = np.fromstring(line, sep=" ", dtype=np.float64)
+                    except BaseException:
+                        continue
+                    if len(parsed) >= 3:
+                        normals[i] = parsed[:3]
+                face_normals = normals
         except BaseException:
             util.log.warning("failed to extract face_normals", exc_info=True)
 

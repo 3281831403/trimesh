@@ -461,26 +461,37 @@ class Trimesh(Geometry3D):
         if len(values) == 0 or values.shape != self.faces.shape:
             log.debug("face_normals incorrect shape, ignoring!")
             return
-        # check if any values are larger than tol.merge
-        # don't set the normals if they are all zero
-        ptp = np.ptp(values)
-        if not np.isfinite(ptp):
-            log.debug("face_normals contain NaN, ignoring!")
-            return
-        if ptp < tol.merge:
-            log.debug("face_normals all zero, ignoring!")
-            return
 
-        # make sure the first few normals match the first few triangles
-        check, valid = triangles.normals(self.vertices.view(np.ndarray)[self.faces[:20]])
-        compare = np.zeros((len(valid), 3))
-        compare[valid] = check
-        if not np.allclose(compare, values[:20]):
-            log.debug("face_normals didn't match triangles, ignoring!")
-            return
+        # calculate the unit normals implied by the face winding
+        # which are the fallback for any normal we don't trust
+        computed, valid = triangles.normals(
+            triangles=self.triangles, crosses=self.triangles_cross
+        )
+        # pad degenerate faces with zeros for correct shape
+        check = np.zeros((len(valid), 3))
+        check[valid] = computed
 
-        # otherwise store face normals
-        self._cache["face_normals"] = values
+        # a passed normal is only trusted per-face: it must be finite,
+        # nonzero, and within one degree of the winding-order normal
+        norm = np.sqrt((values * values).sum(axis=1))
+        nonzero = norm > tol.merge
+        cosine = np.zeros(len(values))
+        cosine[nonzero] = (values[nonzero] * check[nonzero]).sum(axis=1) / norm[nonzero]
+        # cos(1 degree): normals this close to the winding normal are
+        # considered the same direction and kept after normalizing
+        trust = nonzero & (cosine > 0.9998476951563913)
+
+        if not trust.all():
+            log.debug("recomputed %d/%d face_normals from winding",
+                      len(trust) - trust.sum(), len(trust))
+
+        # start from the winding-order normals and substitute the
+        # passed values we trust re-normalized to unit length
+        result = check
+        result[trust] = values[trust] / norm[trust, None]
+
+        # store the validated face normals
+        self._cache["face_normals"] = result
 
     @property
     def vertices(self) -> TrackedArray:

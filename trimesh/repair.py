@@ -181,6 +181,12 @@ def fix_normals(mesh, multibody=False):
     fix_winding(mesh)
     # check to see if a mesh is inverted
     fix_inversion(mesh, multibody=multibody)
+    # if face normals are still sitting in the cache re-validate them
+    # against the current winding: the setter trusts each normal only
+    # if it roughly matches the winding-order normal and recomputes
+    # any corrupt values per-face
+    if "face_normals" in mesh._cache:
+        mesh.face_normals = mesh._cache["face_normals"]
 
 
 def broken_faces(mesh, color=None):
