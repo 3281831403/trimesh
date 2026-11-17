@@ -604,6 +604,15 @@ class EnforcedForest:
             ) and (edge.get("geometry") == kwargs.get("geometry")):
                 return False
 
+        # a node is allowed exactly one parent: if `v` is being
+        # re-parented away from its current parent drop the stale
+        # edge first rather than leaving it in `edge_data`
+        old_parent = self.parents.get(v)
+        if old_parent is not None and old_parent != u:
+            old_edge = (old_parent, v)
+            if old_edge in self.edge_data:
+                del self.edge_data[old_edge]
+
         # store a parent reference for traversal
         self.parents[v] = u
         # store kwargs for edge data keyed with tuple

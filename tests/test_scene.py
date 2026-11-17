@@ -635,6 +635,136 @@ def test_center_mass_no_massive_geometry():
         _ = scene.center_mass
 
 
+def _nested_explode_scene():
+    # world -> root(box A) -> mid(structural) -> leaf(box B)
+    scene = g.trimesh.Scene()
+    tf = g.trimesh.transformations
+    scene.add_geometry(
+        g.trimesh.creation.box(extents=(1, 1, 1)),
+        geom_name="A",
+        node_name="root",
+        parent_node_name="world",
+        transform=tf.translation_matrix([5, 0, 0]),
+    )
+    scene.graph.update(
+        frame_to="mid",
+        frame_from="root",
+        matrix=tf.translation_matrix([0, 5, 0]),
+    )
+    scene.add_geometry(
+        g.trimesh.creation.box(extents=(2, 2, 2)),
+        geom_name="B",
+        node_name="leaf",
+        parent_node_name="mid",
+        transform=tf.translation_matrix([0, 0, 5]),
+    )
+    return scene
+
+
+def test_explode_preserves_tree():
+    # explode must keep the node set and every parent edge
+    scene = _nested_explode_scene()
+    parents_before = dict(scene.graph.transforms.parents)
+    edges_before = set(scene.graph.transforms.edge_data.keys())
+    nodes_before = set(scene.graph.nodes)
+
+    scene.explode(vector=1.0, origin=np.zeros(3))
+
+    assert scene.graph.transforms.parents == parents_before
+    assert set(scene.graph.transforms.edge_data.keys()) == edges_before
+    assert set(scene.graph.nodes) == nodes_before
+
+
+def test_explode_offsets_each_node_once():
+    # each geometry node is translated a single time using its
+    # original world-space position
+    scene = _nested_explode_scene()
+    origin = np.zeros(3)
+    vector = 1.0
+
+    originals = {}
+    expected = {}
+    for node in scene.graph.nodes_geometry:
+        transform, geom_name = scene.graph[node]
+        originals[node] = np.array(transform)
+        centroid = scene.geometry[geom_name].centroid
+        world_centroid = transform @ np.append(centroid, 1)
+        expected[node] = (world_centroid[:3] - origin) * vector
+
+    scene.explode(vector=vector, origin=origin)
+
+    for node in scene.graph.nodes_geometry:
+        moved = scene.graph[node][0][:3, 3] - originals[node][:3, 3]
+        np.testing.assert_allclose(moved, expected[node], atol=1e-8)
+
+    # the structural node never moves in world space
+    mid_world = scene.graph.get(frame_to="mid")[0]
+    np.testing.assert_allclose(mid_world[:3, 3], [5.0, 5.0, 0.0], atol=1e-8)
+
+
+def test_explode_directional_vector():
+    # exercise the (3,) vector branch on a real bundled model
+    scene = g.get_mesh("CesiumMilkTruck.glb")
+    parents_before = dict(scene.graph.transforms.parents)
+    edges_before = set(scene.graph.transforms.edge_data.keys())
+
+    scene.explode(vector=np.array([1.0, 0.0, 0.0]))
+
+    assert scene.graph.transforms.parents == parents_before
+    assert set(scene.graph.transforms.edge_data.keys()) == edges_before
+
+
+def test_scaled_uniform_preserves_graph_and_sharing():
+    scene = _nested_explode_scene()
+    # add a true instance sharing geometry "A"
+    scene.graph.update(
+        frame_to="root_instance",
+        frame_from="root",
+        matrix=g.trimesh.transformations.translation_matrix([0, 0, 3]),
+        geometry="A",
+    )
+
+    nodes_before = set(scene.graph.nodes)
+    edges_before = set(scene.graph.transforms.edge_data.keys())
+    extents_before = scene.extents.copy()
+
+    scaled = scene.scaled(2.0)
+
+    # topology, node set and parent edges are preserved
+    assert set(scaled.graph.nodes) == nodes_before
+    assert set(scaled.graph.transforms.edge_data.keys()) == edges_before
+    # the shared geometry is still referenced by both nodes
+    assert set(scaled.graph.geometry_nodes["A"]) == {"root", "root_instance"}
+    assert set(scaled.geometry.keys()) == set(scene.geometry.keys())
+    # geometry vertices scaled exactly once, no duplicated copies
+    np.testing.assert_allclose(
+        scaled.geometry["A"].vertices, scene.geometry["A"].vertices * 2.0
+    )
+    # world extents scale uniformly
+    np.testing.assert_allclose(scaled.extents, extents_before * 2.0)
+    # original scene is untouched
+    assert set(scene.graph.nodes) == nodes_before
+
+
+def test_scaled_uniform_on_bundled_model():
+    scene = g.get_mesh("CesiumMilkTruck.glb")
+    nodes_before = set(scene.graph.nodes)
+    edges_before = set(scene.graph.transforms.edge_data.keys())
+    extents_before = scene.extents.copy()
+
+    scaled = scene.scaled(3.0)
+
+    assert set(scaled.graph.nodes) == nodes_before
+    assert set(scaled.graph.transforms.edge_data.keys()) == edges_before
+    np.testing.assert_allclose(scaled.extents, extents_before * 3.0)
+
+
+def test_apply_transform_empty_scene():
+    # an empty scene must not raise
+    scene = g.trimesh.Scene()
+    scene.apply_transform(g.trimesh.transformations.translation_matrix([1, 2, 3]))
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_empty()

@@ -8,7 +8,7 @@ from typing import TypeAlias
 # ruff doesn't recognize this correctly when we re-import it from trimesh.typed -_-
 import numpy as np
 
-from .. import caching, convex, grouping, inertia, transformations, units, util
+from .. import caching, convex, inertia, transformations, units, util
 from ..constants import log
 from ..exchange import export
 from ..parent import Geometry, Geometry3D
@@ -111,7 +111,12 @@ class Scene(Geometry3D):
           Homogeneous transformation matrix.
         """
         base = self.graph.base_frame
-        for child in self.graph.transforms.children[base]:
+        children = self.graph.transforms.children.get(base)
+        if not children:
+            # an empty scene (or a base frame without children) has
+            # nothing to transform so return rather than raising
+            return self
+        for child in children:
             combined = np.dot(transform, self.graph[child][0])
             self.graph.update(frame_from=base, frame_to=child, matrix=combined)
         return self
@@ -1008,16 +1013,30 @@ class Scene(Geometry3D):
         # this includes `node`
         graph = self.graph
         nodes = graph.transforms.successors(node)
-        # get every edge that has an included node
-        edges = [e for e in graph.to_edgelist() if e[0] in nodes]
+        # get every edge fully inside the subtree: the edge entering
+        # `node` from its old parent is intentionally dropped since
+        # `node` becomes the base frame of the subscene
+        edges = [e for e in graph.to_edgelist() if e[0] in nodes and e[1] in nodes]
 
         # create a scene graph when
-        graph = SceneGraph(base_frame=node)
-        graph.from_edgelist(edges)
+        sub_graph = SceneGraph(base_frame=node)
+        sub_graph.from_edgelist(edges)
 
-        geometry_names = {e[2]["geometry"] for e in edges if "geometry" in e[2]}
+        # the base frame has no incoming edge so any geometry on the
+        # root node has to be transferred explicitly onto its node data
+        root_geometry = graph.transforms.node_data[node].get("geometry")
+        if root_geometry is not None:
+            sub_graph.transforms.node_data[node]["geometry"] = root_geometry
+            # topology-derived caches (nodes_geometry, ...) must rebuild
+            sub_graph._cache.clear()
+
+        geometry_names = {
+            sub_graph.transforms.node_data[n]["geometry"]
+            for n in nodes
+            if "geometry" in sub_graph.transforms.node_data[n]
+        }
         geometry = {k: self.geometry[k] for k in geometry_names}
-        result = Scene(geometry=geometry, graph=graph)
+        result = Scene(geometry=geometry, graph=sub_graph)
         return result
 
     @caching.cache_decorator
@@ -1156,6 +1175,12 @@ class Scene(Geometry3D):
         """
         Explode the current scene in-place around a point and vector.
 
+        Every geometry node is translated once, by an offset derived
+        from its original world-space position. Parent/child relations
+        are preserved: offsets are compensated into the local edge
+        matrices so structural nodes stay in place and nested geometry
+        is not shifted repeatedly as the graph changes.
+
         Parameters
         -----------
         vector : (3,) float or float
@@ -1171,10 +1196,23 @@ class Scene(Geometry3D):
         vector = np.asanyarray(vector, dtype=np.float64)
         origin = np.asanyarray(origin, dtype=np.float64)
 
-        for node_name in self.graph.nodes_geometry:
-            transform, geometry_name = self.graph[node_name]
+        graph = self.graph
+        base = graph.base_frame
+
+        # snapshot the original world transform of EVERY node (including
+        # structural nodes without geometry) and compute every offset
+        # from these so nested nodes are shifted exactly once
+        world = {
+            node: np.array(graph.get(frame_to=node)[0], dtype=np.float64)
+            for node in graph.nodes
+            if node != base
+        }
+        offsets = {}
+        for node_name in graph.nodes_geometry:
+            transform = world[node_name]
+            _, geometry_name = graph[node_name]
             centroid = self.geometry[geometry_name].centroid
-            # transform centroid into nodes location
+            # transform centroid into the node's original world location
             centroid = np.dot(transform, np.append(centroid, 1))[:3]
 
             if vector.shape == ():
@@ -1186,10 +1224,34 @@ class Scene(Geometry3D):
             else:
                 raise ValueError("explode vector wrong shape!")
 
-            # original transform is read-only
-            T_new = transform.copy()
-            T_new[:3, 3] += offset
-            self.graph[node_name] = T_new
+            offsets[node_name] = offset
+
+        # structural nodes keep their original world pose; geometry
+        # nodes get their single translation appended
+        def desired_world(node):
+            matrix = world[node].copy()
+            if node in offsets:
+                matrix[:3, 3] += offsets[node]
+            return matrix
+
+        # re-express the moved world poses as local edge matrices so
+        # the tree topology (node set and parent edges) is untouched
+        children = graph.transforms.children
+        parent_world = {base: np.eye(4)}
+        # BFS guarantees a parent is visited before its children
+        queue = list(children.get(base, []))
+        while queue:
+            node = queue.pop(0)
+            parent = graph.transforms.parents[node]
+            matrix = util.multi_dot(
+                [np.linalg.inv(parent_world[parent]), desired_world(node)]
+            )
+            # keep any extras stored on the edge (glTF node extras, ...)
+            props = dict(graph.transforms.edge_data[(parent, node)])
+            props.pop("matrix", None)
+            graph.update(frame_from=parent, frame_to=node, matrix=matrix, **props)
+            parent_world[node] = desired_world(node)
+            queue.extend(children.get(node, []))
 
     def scaled(self, scale: Floating | ArrayLike) -> "Scene":
         """
@@ -1280,47 +1342,31 @@ class Scene(Geometry3D):
             result.graph.transforms._modified = str(uuid.uuid4())
             result.graph._cache.clear()
         else:
-            # matrix for 2D scaling
-            scale_2D = np.eye(3) * scale
-            # matrix for 3D scaling
-            scale_3D = np.eye(4) * scale
+            # uniform scaling: keep the graph topology untouched and scale
+            # each shared geometry exactly once in its own local frame,
+            # then scale the translation of every edge. Instances keep
+            # referencing the same geometry object (no copies are made).
+            edge_data = result.graph.transforms.edge_data
 
-            # preallocate transforms and geometries
-            nodes = np.array(self.graph.nodes_geometry)
-            transforms = np.zeros((len(nodes), 4, 4))
-            geometries = [None] * len(nodes)
-
-            # collect list of transforms
-            for i, node in enumerate(nodes):
-                transforms[i], geometries[i] = self.graph[node]
-
-            # remove all existing transforms
-            result.graph.clear()
-
-            for group in grouping.group(geometries):
-                # hashable reference to self.geometry
-                geometry = geometries[group[0]]
-                # original transform from world to geometry
-                original = transforms[group[0]]
-                # transform for geometry
-                new_geom = np.dot(scale_3D, original)
-
-                if result.geometry[geometry].vertices.shape[1] == 2:
-                    # if our scene is 2D only scale in 2D
-                    result.geometry[geometry].apply_transform(scale_2D)
+            # geometry is keyed by name so every shared instance is
+            # visited a single time
+            for geom in result.geometry.values():
+                if hasattr(geom, "vertices") and geom.vertices.shape[1] == 2:
+                    # scale planar geometry with a 2D transform
+                    geom.apply_transform(np.eye(3) * scale)
                 else:
-                    # otherwise apply the full transform
-                    result.geometry[geometry].apply_transform(new_geom)
+                    geom.apply_scale(scale)
 
-                for node, T in zip(nodes[group], transforms[group]):
-                    # generate the new transforms
-                    transform = util.multi_dot([scale_3D, T, np.linalg.inv(new_geom)])
-                    # apply scale to translation
-                    transform[:3, 3] *= scale
-                    # update scene with new transforms
-                    result.graph.update(
-                        frame_to=node, matrix=transform, geometry=geometry
-                    )
+            # scale the translation component of every edge while
+            # preserving every edge's other attributes
+            for uv, props in list(edge_data.items()):
+                if "matrix" not in props:
+                    continue
+                matrix = np.array(props["matrix"], dtype=np.float64)
+                matrix[:3, 3] *= scale
+                updated = dict(props)
+                updated["matrix"] = matrix
+                result.graph.update(frame_from=uv[0], frame_to=uv[1], **updated)
 
         # remove camera from copied
         result._camera = None

@@ -142,6 +142,59 @@ def test_subscene():
     assert list(ss.graph.transforms.edge_data.keys()) == [("3", "4")]
 
 
+def test_subscene_keeps_root_geometry():
+    # a subtree root that carries its own mesh must not lose it,
+    # and geometry from outside the branch must not leak in
+    s = g.trimesh.Scene()
+    box_a = g.trimesh.creation.box(extents=(1, 1, 1))
+    box_b = g.trimesh.creation.box(extents=(2, 2, 2))
+
+    s.add_geometry(
+        box_a,
+        geom_name="A",
+        node_name="root",
+        parent_node_name="world",
+        transform=g.trimesh.transformations.translation_matrix([5, 0, 0]),
+    )
+    # pure structural node
+    s.graph.update(frame_to="mid", frame_from="root")
+    s.add_geometry(box_b, geom_name="B", node_name="leaf", parent_node_name="mid")
+
+    sub = s.subscene("root")
+
+    # node set is exactly the subtree
+    assert set(sub.graph.nodes) == {"root", "mid", "leaf"}
+    # the root's own mesh is retained
+    assert set(sub.graph.nodes_geometry) == {"root", "leaf"}
+    assert set(sub.geometry.keys()) == {"A", "B"}
+    # incoming edge to the new base frame is dropped
+    assert ("world", "root") not in sub.graph.transforms.edge_data
+    # internal edges survive
+    assert set(sub.graph.transforms.edge_data.keys()) == {
+        ("root", "mid"),
+        ("mid", "leaf"),
+    }
+    # geometry references stay shared with the source scene
+    assert sub.geometry["A"] is s.geometry["A"]
+
+
+def test_reparent_drops_stale_edge():
+    # re-parenting a node must replace its parent edge, not leave
+    # the old one dangling in edge_data
+    forest = EnforcedForest()
+    forest.add_edge("world", "a", matrix=g.np.eye(4))
+    forest.add_edge("a", "b", matrix=g.np.eye(4))
+
+    assert forest.parents == {"a": "world", "b": "a"}
+    assert set(forest.edge_data.keys()) == {("world", "a"), ("a", "b")}
+
+    forest.add_edge("world", "b", matrix=g.np.eye(4))
+
+    assert forest.parents == {"a": "world", "b": "world"}
+    assert set(forest.edge_data.keys()) == {("world", "a"), ("world", "b")}
+    assert ("a", "b") not in forest.edge_data
+
+
 def test_scene_transform():
     # get a scene graph
     scene = g.get_mesh("cycloidal.3DXML")
